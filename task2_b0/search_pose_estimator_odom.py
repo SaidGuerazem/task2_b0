@@ -10,7 +10,9 @@ class PoseEstimatorNode(Node):
         super().__init__('pose_estimator_node')
 
         self.declare_parameter('fov_deg', 57.0)
+        self.declare_parameter('fov_deg_h', 87.0)
         self.fov = math.radians(self.get_parameter('fov_deg').value)
+        self.fov_h = math.radians(self.get_parameter('fov_deg_h').value)
 
         self.active = False
         self.initial_yaw = None
@@ -49,41 +51,55 @@ class PoseEstimatorNode(Node):
     def flag_callback(self, msg):
         if msg.data == 'TASK2B_0':
             self.active = True
-            self.initial_yaw = None
             self.collected_positions.clear()
             self.max_flir_detections = 0
+
+            if self.current_yaw is not None:
+                self.initial_yaw = self.current_yaw
+                self.get_logger().info(f'Initial yaw set to {self.initial_yaw:.2f} degrees.')
+            else:
+                self.initial_yaw = None
+                self.get_logger().warn('Initial yaw not set. Waiting for odometry...')
+
             self.get_logger().info('Pose estimation started.')
         elif msg.data == 'OFF':
             self.active = False
             for _ in range(self.max_flir_detections):
                 self.collected_positions.append((self.global_x, self.global_y))
+
             final_msg = ','.join([f"{x:.3f},{y:.3f}" for x, y in self.collected_positions])
             self.publisher_pose.publish(String(data=final_msg))
             self.get_logger().info('Pose estimation stopped and data published.')
 
     def odometry_callback(self, msg):
-        q = msg.q
-        siny_cosp = 2 * (q[3] * q[2] + q[0] * q[1])
-        cosy_cosp = 1 - 2 * (q[1] * q[1] + q[2] * q[2])
+        qw, qx, qy, qz = msg.q  # PX4: [w, x, y, z]
+
+        # Convert quaternion to Euler angles (yaw in ZYX)
+        # Reference: https://en.wikipedia.org/wiki/Conversion_between_quaternions_and_Euler_angles
+
+        # Yaw (Z axis rotation)
+        siny_cosp = 2.0 * (qw * qz + qx * qy)
+        cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
         yaw = math.atan2(siny_cosp, cosy_cosp)
 
-        sinp = 2 * (q[3] * q[1] - q[2] * q[0])
-        pitch = math.asin(sinp) if abs(sinp) <= 1 else math.copysign(math.pi / 2, sinp)
+        # Pitch (Y axis rotation)
+        sinp = 2.0 * (qw * qy - qz * qx)
+        if abs(sinp) >= 1:
+            pitch = math.copysign(math.pi / 2, sinp)
+        else:
+            pitch = math.asin(sinp)
 
-        self.current_pitch = math.degrees(pitch)
         self.current_yaw = math.degrees(yaw)
-
-        if self.initial_yaw is None:
-            self.initial_yaw = self.current_yaw
+        self.current_pitch = math.degrees(pitch)
 
         self.global_x = msg.position[0]
         self.global_y = msg.position[1]
         self.global_z = msg.position[2]
-        self.height = - self.global_z
+        self.height = -self.global_z
+
 
     def centroid_callback(self, msg):
-        if not self.active or self.height is None or self.current_pitch is None or self.current_yaw is None:
-            # print(self.active, self.height, self.current_pitch, self.current_yaw)
+        if not self.active or self.height is None or self.current_pitch is None or self.current_yaw is None or self.initial_yaw is None:
             return
 
         parts = [p.strip() for p in msg.data.split(',')]
@@ -102,22 +118,40 @@ class PoseEstimatorNode(Node):
 
             if camera_name == 'down':
                 current_flir_count += 1
+
             elif camera_name == 'forward' and 0.4 <= cx <= 0.6:
+                # 1. Compute target angle in drone frame
                 angle_deg = 45 + self.current_pitch + (0.5 - cy) * math.degrees(self.fov)
-                alpha_deg = 90 - angle_deg
-                alpha_rad = math.radians(alpha_deg)
+                angle_rad = math.radians(90 - angle_deg)
 
-                dx = self.height / math.tan(alpha_rad)
+                # 2. Distance from drone to target in front
+                dx = self.height / math.tan(angle_rad)
 
-                yaw_diff_rad = math.radians(self.current_yaw - self.initial_yaw)
-                rel_x = dx * math.cos(yaw_diff_rad)
-                rel_y = dx * math.sin(yaw_diff_rad)
-                # print('Relative x.', rel_x)
-                # print('Relative y.', rel_y)
-                # print('alpha_deg', alpha_deg)
-                # print('self.height', self.height)
+                # 3. Horizontal FoV projection (dy computation)
+                y_angle_rad = (cx - 0.5) * self.fov_h
+                slant_range = math.sqrt(self.height**2 + dx**2)
+                dy = math.tan(y_angle_rad) * slant_range
+                # 3. Express point in drone's frame
+                x_local = dx
+                y_local = dy
+                print('For this given point.')
+                
+                print('dx', dx)
+                print('dy', dy)
+                print('height', self.height)
+                print('angle', 90-angle_deg)
+                
+                
 
-                self.collected_positions.append((self.global_x + rel_x, self.global_y + rel_y))
+                # 4. Convert to world frame using current yaw
+                yaw_rad = math.radians(self.current_yaw)
+                print('current yaw', self.current_yaw)
+                print('x_rel', x_local * math.cos(yaw_rad))
+                print('y_rel', x_local * math.sin(yaw_rad))
+                x_world = x_local * math.cos(yaw_rad) - y_local * math.sin(yaw_rad)
+                y_world = x_local * math.sin(yaw_rad) + y_local * math.cos(yaw_rad)
+
+                self.collected_positions.append((x_world, y_world))
 
         if current_flir_count > self.max_flir_detections:
             self.max_flir_detections = current_flir_count
@@ -132,3 +166,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
